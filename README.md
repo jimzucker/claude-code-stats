@@ -144,8 +144,65 @@ Worth knowing before you put a number in a slide:
   discounts, and the fact that you would likely have worked differently if
   every message had a price tag.
 - **Transcripts can disappear.** They are local files with no guarantee of
-  permanence. If a project's history matters to you, run `--md` and commit the
-  report — the report survives even when the transcripts do not.
+  permanence — see [Don't lose your history](#dont-lose-your-history) below.
+
+## Don't lose your history
+
+Transcripts are ephemeral. They get pruned, orphaned by renaming a repo, or
+lost with the machine — and when they go, the record of how a project was built
+goes with them. This tool handles that in three ways.
+
+### 1. Commit a baseline
+
+A **baseline** is a small JSON file in your repo that freezes totals already
+observed. Later runs add live transcripts on top of it, so the numbers stay
+whole even after the underlying files are gone.
+
+```bash
+# fold everything visible right now into the baseline
+python3 ~/.claude/skills/stats/session_stats.py --update-baseline
+git add docs/session-stats-baseline.json && git commit -m "chore: update build-stats baseline"
+```
+
+Run it whenever you finish a chunk of work. Transcripts already inside the
+baseline's window are skipped on later runs, so nothing is double counted.
+
+### 2. Rescue an existing report
+
+Already lost transcripts but committed a `SESSION_STATS.md` earlier? That report
+is a usable record — import it:
+
+```bash
+python3 ~/.claude/skills/stats/session_stats.py --import-baseline docs/SESSION_STATS.md
+```
+
+It reads the totals and the period covered, and from then on your stats include
+that history even though the transcripts behind it no longer exist.
+
+### 3. The overwrite guard
+
+`--md` **refuses** to replace a report that covers more than the current run:
+
+```
+Refusing to overwrite docs/SESSION_STATS.md.
+  It records 81,411 records; this run sees only 1,258.
+  Transcripts have probably been pruned. Preserve the existing numbers with:
+      --import-baseline docs/SESSION_STATS.md
+  then re-run --md. Use --force to overwrite anyway.
+```
+
+Without this, a routine regeneration silently destroys the only surviving copy
+of your history. That is not hypothetical — it is why the guard exists.
+
+### Belt and braces
+
+The baseline protects the *numbers*. It does not preserve the *conversations*.
+If those matter, back up `~/.claude/projects/` — and check that you actually
+have a working machine backup:
+
+```bash
+tmutil destinationinfo        # "No destinations configured" means no safety net
+```
 
 ## Requirements
 

@@ -29,6 +29,8 @@ import argparse
 import datetime as dt
 import glob
 import json
+import pathlib
+import re
 import os
 import subprocess
 import sys
@@ -120,6 +122,101 @@ def encode_alias(value: str) -> str:
         return os.path.abspath(v).replace("/", "-")
     sibling = os.path.join(os.path.dirname(repo_root()), v)
     return os.path.abspath(sibling).replace("/", "-")
+
+
+# ---------------------------------------------------------------- baseline --
+# Transcripts are local files with no guarantee of permanence: they can be
+# pruned, lost with a machine, or orphaned by renaming the repo. A baseline is
+# a small JSON file COMMITTED TO THE REPO that freezes totals already observed,
+# so a later run reports the whole build even when the underlying transcripts
+# are gone. Live transcripts that the baseline already covers are skipped, so
+# nothing is double counted.
+BASELINE_NAME = os.path.join("docs", "session-stats-baseline.json")
+
+
+def baseline_path(repo: str, explicit: str | None) -> str:
+    return explicit or os.path.join(repo, BASELINE_NAME)
+
+
+def load_baseline(path: str) -> dict | None:
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as fh:
+            b = json.load(fh)
+    except (OSError, ValueError) as e:
+        sys.exit(f"Baseline {path} is unreadable: {e}")
+    if "covers_through" not in b:
+        sys.exit(f"Baseline {path} has no 'covers_through' — refusing to guess.")
+    return b
+
+
+def baseline_cutoff(b: dict):
+    """The baseline's cutoff as an aware datetime.
+
+    A cutoff imported from a Markdown report has no UTC offset (the report
+    prints a local wall-clock time), while transcript timestamps are aware —
+    comparing the two raises. Assume local time for a naive value.
+    """
+    t = dt.datetime.fromisoformat(b["covers_through"])
+    if t.tzinfo is None:
+        t = t.astimezone()
+    return t
+
+
+def save_baseline(path: str, b: dict) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "w") as fh:
+        json.dump(b, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+
+
+def _num(text: str, pattern: str, default=0) -> int:
+    m = re.search(pattern, text)
+    return int(m.group(1).replace(",", "")) if m else default
+
+
+def import_baseline_from_md(md_path: str, project: str) -> dict:
+    """Seed a baseline from an already-committed SESSION_STATS.md.
+
+    This is the rescue path: the committed report may be the only surviving
+    record of a build whose transcripts are gone.
+    """
+    text = pathlib.Path(md_path).read_text()
+    end = re.search(r"\| Session end \| ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]+)", text)
+    start = re.search(r"\| Session start \| ([0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]+)", text)
+    if not end:
+        sys.exit(f"Could not find a 'Session end' row in {md_path}; "
+                 "cannot tell what period this report covers.")
+
+    def secs(label: str) -> int:
+        m = re.search(label + r" \| (?:~)?(?:(\d+)h )?(?:(\d+)m )?(?:(\d+)s)?", text)
+        if not m:
+            return 0
+        h, mi, se = (int(g or 0) for g in m.groups())
+        return h * 3600 + mi * 60 + se
+
+    return {
+        "note": ("Frozen totals for the period below, imported from a committed "
+                 "report. Live transcripts ending at or before 'covers_through' "
+                 "are skipped so nothing is counted twice."),
+        "project": project,
+        "source": os.path.relpath(md_path),
+        "imported_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "span_start": start.group(1) if start else None,
+        "covers_through": end.group(1).replace(" ", "T"),
+        "records": _num(text, r"\(([\d,]+) records"),
+        "output_tokens": _num(text, r"\| Output \(generated\) \| ([\d,]+)"),
+        "input_tokens": _num(text, r"\| Input \(uncached\) \| ([\d,]+)"),
+        "cache_creation_input_tokens": _num(text, r"\| Cache write \| ([\d,]+)"),
+        "cache_read_input_tokens": _num(text, r"\| Cache read \| ([\d,]+)"),
+        "prompts": _num(text, r"\*\*~?([\d,]+) prompts you typed"),
+        "assistant_turns": _num(text, r"\*\*([\d,]+) assistant turns\*\*"),
+        "active_seconds": secs(r"\| Active \(gaps <5m\)"),
+        "claude_seconds": secs(r"Claude working"),
+        "user_seconds": secs(r"User prompting"),
+        "idle_seconds": secs(r"\| Idle \(excluded\)"),
+    }
 
 
 def find_transcripts(args_paths: list[str], also: list[str]) -> list[str]:
@@ -234,7 +331,7 @@ def write_markdown(path, project, files, n_rows, outp, inp, cc, cr, total,
         "",
         f"The real numbers behind building **{project}**, pulled from this "
         f"project's Claude Code session transcript ({n_rows:,} records spanning "
-        "the whole build). Regenerate with `python3 scripts/session_stats.py --md`.",
+        "the whole build). Regenerate with `python3 ~/.claude/skills/stats/session_stats.py --md` (run from the repo root), or the /stats slash command.",
         "",
         "## Tokens",
         "",
@@ -362,6 +459,19 @@ def main() -> None:
     ap.add_argument("--also", action="append", default=[], metavar="REPO",
                     help="extra encoded project-dir name(s) to fold in, beyond "
                          "this repo's own and ALIAS_PROJECT_DIRS (repeatable)")
+    ap.add_argument("--baseline", metavar="PATH", default=None,
+                    help=f"baseline JSON to fold in (default <repo>/{BASELINE_NAME})")
+    ap.add_argument("--no-baseline", action="store_true",
+                    help="ignore the baseline; report only live transcripts")
+    ap.add_argument("--import-baseline", metavar="REPORT.md", default=None,
+                    help="one-time: seed the baseline from a committed "
+                         "SESSION_STATS.md, then exit")
+    ap.add_argument("--update-baseline", action="store_true",
+                    help="fold everything seen now into the baseline and "
+                         "advance its cutoff, then exit (commit the result)")
+    ap.add_argument("--force", action="store_true",
+                    help="allow --md to overwrite a report covering more than "
+                         "this run does")
     ap.add_argument("--rate-output", type=float, default=RATES["output"])
     ap.add_argument("--rate-input", type=float, default=RATES["input"])
     ap.add_argument("--rate-cache-write", type=float, default=RATES["cache_write"])
@@ -374,10 +484,31 @@ def main() -> None:
         "cache_read": args.rate_cache_read,
     }
 
+    bpath = baseline_path(repo_root(), args.baseline)
+
+    if args.import_baseline:
+        b = import_baseline_from_md(args.import_baseline, project_name())
+        save_baseline(bpath, b)
+        print(f"Wrote baseline {bpath}")
+        print(f"  covers through {b['covers_through']} — "
+              f"{b['records']:,} records, {b['output_tokens']:,} output tokens")
+        print("  Commit this file; it survives the transcripts.")
+        return
+
+    base = None if args.no_baseline else load_baseline(bpath)
+    cutoff = baseline_cutoff(base) if base else None
+
     files = find_transcripts(args.paths, args.also)
     rows: list[dict] = []
+    skipped = 0
     for p in files:
-        rows.extend(load(p))
+        frows = load(p)
+        if cutoff is not None and frows:
+            last = max((t for t in (parse_ts(r) for r in frows) if t), default=None)
+            if last is not None and last <= cutoff:
+                skipped += 1        # already inside the baseline period
+                continue
+        rows.extend(frows)
 
     inp = outp = cc = cr = 0
     assistant_turns = 0
@@ -409,13 +540,76 @@ def main() -> None:
             else:
                 claude += gap
 
+    live_records = len(rows)
+    if base:
+        outp += base.get("output_tokens", 0)
+        inp += base.get("input_tokens", 0)
+        cc += base.get("cache_creation_input_tokens", 0)
+        cr += base.get("cache_read_input_tokens", 0)
+        prompts += base.get("prompts", 0)
+        assistant_turns += base.get("assistant_turns", 0)
+        active += dt.timedelta(seconds=base.get("active_seconds", 0))
+        claude += dt.timedelta(seconds=base.get("claude_seconds", 0))
+        user += dt.timedelta(seconds=base.get("user_seconds", 0))
+        idle += dt.timedelta(seconds=base.get("idle_seconds", 0))
+        if base.get("span_start"):
+            try:
+                events = [dt.datetime.fromisoformat(
+                    base["span_start"].replace(" ", "T"))] + events
+            except ValueError:
+                pass
+
     total = inp + outp + cc + cr
+    n_records = live_records + (base.get("records", 0) if base else 0)
+
+    if args.update_baseline:
+        newest = max(events) if events else None
+        merged = dict(base or {})
+        merged.update({
+            "note": ("Frozen totals for the period below. Live transcripts "
+                     "ending at or before 'covers_through' are skipped so "
+                     "nothing is counted twice."),
+            "project": project_name(),
+            "updated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "covers_through": (newest or dt.datetime.now().astimezone()).isoformat(),
+            "span_start": (merged.get("span_start")
+                           or (min(events).isoformat() if events else None)),
+            "records": n_records,
+            "output_tokens": outp, "input_tokens": inp,
+            "cache_creation_input_tokens": cc, "cache_read_input_tokens": cr,
+            "prompts": prompts, "assistant_turns": assistant_turns,
+            "active_seconds": int(active.total_seconds()),
+            "claude_seconds": int(claude.total_seconds()),
+            "user_seconds": int(user.total_seconds()),
+            "idle_seconds": int(idle.total_seconds()),
+        })
+        save_baseline(bpath, merged)
+        print(f"Updated baseline {bpath}")
+        print(f"  now covers through {merged['covers_through']} — "
+              f"{n_records:,} records, {outp:,} output tokens")
+        print("  Commit this file; it survives the transcripts.")
+        return
 
     if args.md == "":
         args.md = os.path.join(repo_root(), "docs", "SESSION_STATS.md")
     if args.md is not None:
+        # Never let a thinner run silently replace a fuller record: the report
+        # may be the last surviving evidence of transcripts that are now gone.
+        if os.path.isfile(args.md) and not args.force:
+            prev = _num(pathlib.Path(args.md).read_text(), r"\(([\d,]+) records")
+            if prev > n_records:
+                sys.exit(
+                    f"Refusing to overwrite {args.md}.\n"
+                    f"  It records {prev:,} records; this run sees only "
+                    f"{n_records:,}.\n"
+                    f"  Transcripts have probably been pruned. Preserve the "
+                    f"existing numbers with:\n"
+                    f"      python3 {os.path.relpath(__file__)} "
+                    f"--import-baseline {os.path.relpath(args.md)}\n"
+                    f"  then re-run --md. Use --force to overwrite anyway."
+                )
         n_user_records = sum(1 for r in rows if r.get("type") == "user")
-        write_markdown(args.md, project_name(), files, len(rows), outp, inp, cc,
+        write_markdown(args.md, project_name(), files, n_records, outp, inp, cc,
                        cr, total, prompts, assistant_turns, events, active,
                        claude, user, idle, args.idle, n_user_records, rates)
         print(f"Wrote {args.md}")
@@ -440,13 +634,16 @@ def main() -> None:
         extras.append("incl. subagents")
     if ALIAS_PROJECT_DIRS or args.also:
         extras.append("pre-rename history")
+    if base:
+        extras.append("incl. committed baseline")
     note = f" ({', '.join(extras)})" if extras else ""
+    n_files = len(files) - skipped
 
     c = costs(outp, inp, cc, cr, rates)
     cr_pct = f"{cr / total * 100:.0f}%" if total else "0%"
     out = [
         f"📊 Session stats — {project_name()}",
-        f"_{len(files)} transcripts{note} · {len(rows):,} records_",
+        f"_{n_files} transcripts{note} · {n_records:,} records_",
         "",
         f"Tokens — {mag(total)} total",
         f"- Output (generated): {mag(outp)}",
@@ -468,7 +665,7 @@ def main() -> None:
         ]
     out += [
         "",
-        "Cost (metered-API equivalent, Opus 4.8 rates)",
+        "Cost (metered-API equivalent, Opus 5 / Opus 4.8 rates)",
         f"- ${c['total']:,.2f} — cache read ${c['cache_read']:,.0f} · "
         f"cache write ${c['cache_write']:,.0f} · output ${c['output']:,.0f} · "
         f"input ${c['input']:,.0f}",

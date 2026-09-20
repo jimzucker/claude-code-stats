@@ -74,6 +74,27 @@ the one that moves the number. If the user asks about a model not listed here,
 fetch `platform.claude.com/docs/en/about-claude/pricing.md` rather than
 recalling the rates.
 
+## Durability — baselines
+
+Transcripts are ephemeral; they get pruned or orphaned by a repo rename. A
+**baseline** (`docs/session-stats-baseline.json`, committed) freezes totals
+already seen, and later runs add live transcripts on top without double
+counting.
+
+| Command | Use |
+|---|---|
+| `--update-baseline` | Fold everything visible now into the baseline. Run periodically; commit the JSON. |
+| `--import-baseline docs/SESSION_STATS.md` | Rescue history from an already-committed report when the transcripts are gone. |
+| `--no-baseline` | Report live transcripts only. |
+
+`--md` refuses to overwrite a report covering more records than the current run
+sees, and tells the user to import it as a baseline first. **Do not pass
+`--force` to get past that** unless the user explicitly asks — the existing
+report may be the only surviving record of the build.
+
+If a run shows far fewer records than expected, suspect pruned transcripts
+rather than a bug, and check for a committed report to import.
+
 ## Reporting
 
 Present tokens, prompts/turns, active time, and estimated cost. Note that the
