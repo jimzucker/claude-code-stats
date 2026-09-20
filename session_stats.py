@@ -219,7 +219,8 @@ def import_baseline_from_md(md_path: str, project: str) -> dict:
     }
 
 
-def find_transcripts(args_paths: list[str], also: list[str]) -> list[str]:
+def find_transcripts(args_paths: list[str], also: list[str],
+                     allow_empty: bool = False) -> list[str]:
     if args_paths:
         return args_paths
     base = os.path.dirname(transcript_dir_for(repo_root()))  # ~/.claude/projects
@@ -233,6 +234,8 @@ def find_transcripts(args_paths: list[str], also: list[str]) -> list[str]:
         per_dir.append((d, len(found)))
         files.extend(found)
     files = sorted(set(files))
+    if not files and allow_empty:
+        return []            # a baseline carries the history instead
     if not files:
         # Say which dirs were searched and why each came up empty, rather than
         # naming only the first — an empty dir and a misspelled one look the
@@ -498,7 +501,8 @@ def main() -> None:
     base = None if args.no_baseline else load_baseline(bpath)
     cutoff = baseline_cutoff(base) if base else None
 
-    files = find_transcripts(args.paths, args.also)
+    files = find_transcripts(args.paths, args.also,
+                             allow_empty=base is not None)
     rows: list[dict] = []
     skipped = 0
     for p in files:
